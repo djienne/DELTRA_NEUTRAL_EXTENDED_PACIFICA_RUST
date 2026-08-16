@@ -7,11 +7,16 @@ Called from Rust to ensure 100% compatibility with Extended's signature format.
 import sys
 import json
 import math
+from pathlib import Path
 from decimal import Decimal
 from datetime import datetime, timedelta
 
-# Add Python SDK to path
-sys.path.insert(0, "../python_sdk-starknet")
+# Add the vendored Python SDK to the path, anchored to THIS file rather than the
+# working directory. Rust invokes this script as a subprocess, so the CWD is
+# whatever the caller happened to be in -- the previous relative "../python_sdk-starknet"
+# only resolved when launched from scripts/. .parent.parent is this project's
+# root (this file lives in scripts/), so it stays inside the project.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python_sdk-starknet"))
 
 from fast_stark_crypto import get_order_msg_hash, sign
 from x10.perpetual.configuration import StarknetDomain

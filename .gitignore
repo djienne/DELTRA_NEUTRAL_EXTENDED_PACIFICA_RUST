@@ -47,3 +47,9 @@ Thumbs.db
 # Editor/tooling backups - never commit
 *.bak
 *.bak-*
+
+# Python - this is a Rust project, but scripts/ and the vendored
+# python_sdk-starknet/ are Python and generate bytecode caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
