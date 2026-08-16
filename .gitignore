@@ -43,3 +43,7 @@ CLAUDE.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Editor/tooling backups - never commit
+*.bak
+*.bak-*

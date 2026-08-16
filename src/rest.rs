@@ -706,7 +706,32 @@ impl RestClient {
 
         // For normal orders, enforce exchange minimum. For reduce-only, avoid bumping up which can exceed size.
         if !reduce_only {
+            // NOTE: this bump is applied to the EXTENDED leg only. If it raises the
+            // size above what the Pacifica leg will carry, the pair is no longer
+            // delta-neutral -- the caller must compare the two fills rather than
+            // assume the requested size was used.
             quantity = quantity.max(min_size);
+        }
+
+        // Reject a zero/negative quantity HERE rather than letting it reach the
+        // signer.
+        //
+        // calculate_signed_amounts() does `assert!(quantity > 0.0)`, and an assert
+        // is a PANIC, not an error: it kills the process. Reduce-only floors without
+        // a minimum bump (see above), so any dust position smaller than one size
+        // increment rounds to exactly 0.0 -- and the panic then happens midway
+        // through a close, taking the process down with the OTHER leg still open,
+        // straight into `restart: unless-stopped`, which re-panics on the same dust.
+        //
+        // A dust residual is a normal, recoverable condition. It must surface as an
+        // error the caller can handle, never as process death.
+        if !(quantity > 0.0) {
+            return Err(ConnectorError::Other(format!(
+                "Refusing to submit a zero-size order for {} (raw={}, increment={}, \
+                 reduce_only={}). The remaining position is smaller than one size \
+                 increment; it must be closed manually or left as dust.",
+                market, raw_quantity, size_increment, reduce_only
+            )));
         }
 
         // Calculate formatting precisions

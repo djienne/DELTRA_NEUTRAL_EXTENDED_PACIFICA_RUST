@@ -20,7 +20,21 @@ use tracing::{info, warn, error};
 use prettytable::{Table, Row, Cell, format};
 use colored::*;
 
-const DEFAULT_STATE_FILE: &str = "bot_state.json";
+/// Default state path.
+///
+/// This MUST match the path docker-compose mounts and sets via STATE_FILE_PATH
+/// (`./state` -> `/app/state`, `STATE_FILE_PATH=/app/state/bot_state.json`).
+///
+/// It used to be the bare `bot_state.json` at the repo root, which meant the container
+/// wrote `state/bot_state.json` while any host-run binary (notably `emergency_exit`)
+/// read a *different, stale* file at the root. That is how emergency_exit came to report
+/// "EMERGENCY EXIT SUCCESSFUL / All positions closed" while both legs were still open:
+/// it loaded a stale root file, found `current_position: None`, and returned Ok(())
+/// without ever querying the exchanges.
+const DEFAULT_STATE_FILE: &str = "state/bot_state.json";
+
+/// Pre-collapse location, kept only so we can warn if it is still lying around.
+const LEGACY_STATE_FILE: &str = "bot_state.json";
 const MONITORING_INTERVAL_MINUTES: u64 = 15;
 const LIVE_POSITIONS_MAX_ATTEMPTS: u32 = 6;
 
@@ -156,7 +170,22 @@ pub struct FundingBot {
 }
 
 fn resolve_state_path() -> String {
-    std::env::var("STATE_FILE_PATH").unwrap_or_else(|_| DEFAULT_STATE_FILE.to_string())
+    let path = std::env::var("STATE_FILE_PATH").unwrap_or_else(|_| DEFAULT_STATE_FILE.to_string());
+
+    // A leftover root-level bot_state.json is a decoy: it is the file the old default
+    // pointed at, so anything still reading it sees stale positions. Warn loudly rather
+    // than silently picking one, because "which file am I reading" is exactly the
+    // ambiguity that made emergency_exit report success over an open position.
+    if path != LEGACY_STATE_FILE && Path::new(LEGACY_STATE_FILE).exists() {
+        warn!(
+            "Stale legacy state file '{}' exists but '{}' is in use. \
+             The legacy file is NOT read - delete it once you have confirmed it holds \
+             nothing you need, so it cannot be mistaken for live state.",
+            LEGACY_STATE_FILE, path
+        );
+    }
+
+    path
 }
 
 impl FundingBot {
@@ -592,21 +621,40 @@ impl FundingBot {
         // Set leverage to 1x on both exchanges before opening position
         info!("{}", "⚙️  Setting leverage to 1x on both exchanges...");
 
-        // Set Extended leverage to 1x
-        match self.extended_client.update_leverage(&extended_market, "1").await {
-            Ok(_) => info!("   ✅ Extended leverage set to 1x for {}", extended_market),
-            Err(e) => {
-                warn!("   ⚠️  Failed to set Extended leverage (continuing anyway): {}", e);
-            }
-        }
+        // Set leverage on BOTH venues. A failure here ABORTS the open.
+        //
+        // These used to log "continuing anyway" and proceed. That is unsafe: the
+        // bot deploys 95% of available capital believing it is at 1x. If the venue
+        // still carries a previously-set leverage (say 20x isolated), the same
+        // notional posts a twentieth of the margin, and a ~6% adverse move over the
+        // 23h hold liquidates that leg -- leaving the other side naked and
+        // directional, from a position the operator believed was market-neutral at
+        // 1x.
+        //
+        // Worse, the failure is asymmetric: setting 1x on one venue and silently
+        // leaving the other at 20x produces legs that are equal in SIZE but wildly
+        // unequal in margin consumption, which is exactly the blow-up mode
+        // cross-exchange delta-neutral is supposed to avoid.
+        self.extended_client
+            .update_leverage(&extended_market, "1")
+            .await
+            .map_err(|e| format!(
+                "Refusing to open {}: could not set Extended leverage to 1x ({}). \
+                 Opening at unknown leverage risks liquidating one leg.",
+                extended_market, e
+            ))?;
+        info!("   ✅ Extended leverage set to 1x for {}", extended_market);
 
-        // Set Pacifica leverage to 1x
-        match self.pacifica_client.update_leverage(&pacifica_market, 1).await {
-            Ok(_) => info!("   ✅ Pacifica leverage set to 1x for {}", pacifica_market),
-            Err(e) => {
-                warn!("   ⚠️  Failed to set Pacifica leverage (continuing anyway): {}", e);
-            }
-        }
+        self.pacifica_client
+            .update_leverage(&pacifica_market, 1)
+            .await
+            .map_err(|e| format!(
+                "Refusing to open {}: could not set Pacifica leverage to 1x ({}). \
+                 Extended is already at 1x; opening now would give the two legs \
+                 mismatched margin profiles.",
+                pacifica_market, e
+            ))?;
+        info!("   ✅ Pacifica leverage set to 1x for {}", pacifica_market);
 
         // Open delta neutral position
         let position = open_delta_neutral_position(
@@ -668,7 +716,58 @@ impl FundingBot {
 
             info!("{}", "✅ Position closed successfully!");
         } else {
-            warn!("{}", "No active position to close");
+            // DO NOT just return Ok(()) here.
+            //
+            // This branch used to log "No active position to close" and succeed,
+            // which is how emergency_exit printed "EMERGENCY EXIT SUCCESSFUL / All
+            // positions closed" while both legs were still open. An empty state
+            // file is not evidence of a flat account -- especially for
+            // emergency_exit, which historically ran on the host against a
+            // different (stale) state path than the container writes.
+            //
+            // Query BOTH venues account-wide before concluding there is nothing to
+            // close. reconcile_state() cannot help: it returns early when
+            // current_position is None, so it only ever validates a symbol we
+            // already know about.
+            warn!("No position in state - querying BOTH venues account-wide before \
+                   concluding there is nothing to close");
+
+            let ext_live = self.extended_client.get_positions(None).await
+                .map_err(|e| format!("Extended position scan failed: {}. Refusing to \
+                                      report success over an unknown account state.", e))?;
+            let pac_live = self.pacifica_client.get_positions().await
+                .map_err(|e| format!("Pacifica position scan failed: {}. Refusing to \
+                                      report success over an unknown account state.", e))?;
+
+            let ext_open: Vec<_> = ext_live.into_iter()
+                .filter(|p| p.size.parse::<f64>().unwrap_or(0.0).abs() > 0.0)
+                .collect();
+            let pac_open: Vec<_> = pac_live.into_iter()
+                .filter(|p| p.amount.parse::<f64>().unwrap_or(0.0).abs() > 0.0)
+                .collect();
+
+            if ext_open.is_empty() && pac_open.is_empty() {
+                info!("Verified flat: no open positions on Extended or Pacifica");
+                return Ok(());
+            }
+
+            error!(
+                "UNTRACKED POSITIONS FOUND: {} on Extended, {} on Pacifica, none in \
+                 state. These are unhedged and unmanaged.",
+                ext_open.len(), pac_open.len()
+            );
+            for p in &ext_open {
+                error!("  Extended: {} size={} ", p.market, p.size);
+            }
+            for p in &pac_open {
+                error!("  Pacifica: {} amount={} side={}", p.symbol, p.amount, p.side);
+            }
+            return Err(format!(
+                "Refusing to report success: {} Extended and {} Pacifica position(s) \
+                 are open but absent from state. Close them manually and verify both \
+                 venues before restarting.",
+                ext_open.len(), pac_open.len()
+            ).into());
         }
 
         Ok(())

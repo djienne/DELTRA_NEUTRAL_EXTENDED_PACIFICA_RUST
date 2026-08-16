@@ -1,9 +1,3 @@
-networks:
-  default:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.8.68.0/22
 
 services:
   trading-bot:

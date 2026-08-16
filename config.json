@@ -3,11 +3,13 @@
     "min_combined_volume_usd": 20000000,
     "max_intra_exchange_spread_pct": 0.15,
     "max_cross_exchange_spread_pct": 0.25,
-    "min_net_apr_pct": 5.0
+    "_comment_min_net_apr_pct": "RAISED 5.0 -> 48.0. Gross funding-spread threshold, sized to clear the 23.7% break-even at the new 48h hold with ~2x margin. Round trip is 0.130% (Extended taker 0.025% + Pacifica taker 0.040%, both legs, entry and exit).",
+    "min_net_apr_pct": 48.0
   },
   "trading": {
     "max_position_size_usd": 800.0,
-    "hold_time_hours": 23
+    "_comment_hold_time_hours": "RAISED 23 -> 48. Break-even APR = roundtrip_fee_pct * (8760/hold_hours). At 23h the break-even was 49.5% against a 5.0 threshold, so most accepted rotations lost ~0.13% each; 57 rotations ran under those settings. At 48h the break-even is 23.7%.",
+    "hold_time_hours": 48
   },
   "display": {
     "max_opportunities_shown": 10,
@@ -22,7 +24,7 @@
     "min_combined_volume_usd": "Minimum 24h volume in USD (Extended + Pacifica combined)",
     "max_intra_exchange_spread_pct": "Maximum bid-ask spread % within each exchange (Extended and Pacifica)",
     "max_cross_exchange_spread_pct": "Maximum mid-price difference % between exchanges",
-    "min_net_apr_pct": "Minimum net APR % (funding rate arbitrage profit after spreads)",
+    "min_net_apr_pct": "Minimum GROSS APR % (the funding-rate spread between the two venues). WARNING: 'net' here means net of the other leg's funding ONLY - it is NOT net of trading costs. No fee term exists anywhere in the entry filter. Verified round-trip cost for this pair is 0.130% (Extended taker 0.025% + Pacifica taker 0.040%, both legs, entry and exit), so at hold_time_hours=23 the true break-even is 49.5% APR. A setting of 5.0 accepts trades that lose money on ~10 out of every 10 cycles.",
     "max_position_size_usd": "Maximum notional USD value per position (applied per exchange, limited by available capital)",
     "hold_time_hours": "Time in hours to hold a position before considering rotation (default: 48)",
     "fetch_timeout_seconds": "HTTP request timeout for API calls",

@@ -33,8 +33,12 @@ COPY examples ./examples
 # Copy Python signing script
 COPY scripts ./scripts
 
-# Build release binary
-RUN cargo build --release
+# Build release binaries.
+# emergency_exit MUST be built and shipped alongside the bot. When it was missing from
+# the image it could only be run on the host, where STATE_FILE_PATH is unset - so it read
+# a different (stale) state file than the container writes, found no position, and
+# printed "EMERGENCY EXIT SUCCESSFUL" while both legs were still open.
+RUN cargo build --release --bin extended_connector --bin emergency_exit
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -60,8 +64,9 @@ RUN useradd -m -u 1000 botuser
 # Create app directory
 WORKDIR /app
 
-# Copy binary from builder
+# Copy binaries from builder
 COPY --from=builder /app/target/release/extended_connector /app/extended_connector
+COPY --from=builder /app/target/release/emergency_exit /app/emergency_exit
 
 # Copy Python signing script
 COPY --from=builder /app/scripts /app/scripts
